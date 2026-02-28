@@ -37,13 +37,14 @@ main_logger.info("FastMCP server initialized with name 'rocketchat'")
 rocket_client = None
 
 class RocketChatAPI:
-    def __init__(self, server_url, username=None, password=None, user_id=None, auth_token=None):
+    def __init__(self, server_url, username=None, password=None, user_id=None, auth_token=None, verify_ssl=True):
         self.server_url = server_url.rstrip('/')
         self.logger = logging.getLogger("RocketChatAPI")
         self.auth_token = None
         self.user_id = None
         self.username = username
         self.password = password
+        self.verify_ssl = verify_ssl
         
         self.logger.info(f"Initializing RocketChat API client for server: {self.server_url}")
         
@@ -62,7 +63,7 @@ class RocketChatAPI:
         url = f"{self.server_url}/api/v1/login"
         self.logger.info(f"Attempting login for user: {username}")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
             try:
                 response = await client.post(url, json={"user": username, "password": password})
                 response.raise_for_status()
@@ -87,17 +88,23 @@ class RocketChatAPI:
             'Content-type': 'application/json'
         }
 
+    def _auth_headers(self):
+        return {
+            'X-Auth-Token': self.auth_token,
+            'X-User-Id': self.user_id,
+        }
+
     async def async_request(self, method: str, endpoint: str, json_data=None, params=None):
         """Make async HTTP request to RocketChat API"""
         url = f"{self.server_url}/api/v1/{endpoint}"
         self.logger.info(f"Making {method} request to {endpoint}")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
             try:
                 response = await client.request(
-                    method, url, 
-                    headers=self._headers(), 
-                    json=json_data, 
+                    method, url,
+                    headers=self._headers(),
+                    json=json_data,
                     params=params,
                     timeout=30.0
                 )
@@ -162,8 +169,11 @@ async def send_message_in_channel(channel: str, text: str) -> str:
             json_data={"channel": channel, "text": text}
         )
         if result.get('success'):
+            msg = result.get('message', {})
+            msg_id = msg.get('_id', 'N/A')
+            rid = msg.get('rid', 'N/A')
             main_logger.info(f"Message sent successfully to channel: {channel}")
-            return f"Message sent successfully to {channel}"
+            return f"Message sent to {channel} (msgId: {msg_id}, roomId: {rid})"
         else:
             error_msg = result.get('error', 'Unknown error')
             main_logger.error(f"Failed to send message to {channel}: {error_msg}")
@@ -171,6 +181,186 @@ async def send_message_in_channel(channel: str, text: str) -> str:
     except Exception as e:
         main_logger.error(f"Error sending message to {channel}: {str(e)}")
         return f"Error sending message: {str(e)}"
+
+@mcp.tool()
+async def send_direct_message(username: str, text: str) -> str:
+    """Send a direct message to a user.
+
+    Args:
+        username: Username of the recipient
+        text: Message text to send
+    """
+    main_logger.info(f"send_direct_message called - to: {username}, text length: {len(text)}")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    try:
+        result = await rocket_client.async_request(
+            "POST", "chat.postMessage",
+            json_data={"channel": f"@{username}", "text": text}
+        )
+        if result.get('success'):
+            msg = result.get('message', {})
+            msg_id = msg.get('_id', 'N/A')
+            rid = msg.get('rid', 'N/A')
+            main_logger.info(f"Direct message sent to {username}")
+            return f"Direct message sent to {username} (msgId: {msg_id}, roomId: {rid})"
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            main_logger.error(f"Failed to send DM to {username}: {error_msg}")
+            return f"Failed to send direct message: {error_msg}"
+    except Exception as e:
+        main_logger.error(f"Error sending DM to {username}: {str(e)}")
+        return f"Error sending direct message: {str(e)}"
+
+@mcp.tool()
+async def delete_message(room_id: str, msg_id: str) -> str:
+    """Delete a message.
+
+    Args:
+        room_id: ID of the room containing the message
+        msg_id: ID of the message to delete
+    """
+    main_logger.info(f"delete_message called - room_id: {room_id}, msg_id: {msg_id}")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    try:
+        result = await rocket_client.async_request(
+            "POST", "chat.delete",
+            json_data={"roomId": room_id, "msgId": msg_id}
+        )
+        if result.get('success'):
+            main_logger.info(f"Message {msg_id} deleted")
+            return f"Message {msg_id} deleted successfully"
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            main_logger.error(f"Failed to delete message {msg_id}: {error_msg}")
+            return f"Failed to delete message: {error_msg}"
+    except Exception as e:
+        main_logger.error(f"Error deleting message {msg_id}: {str(e)}")
+        return f"Error deleting message: {str(e)}"
+
+@mcp.tool()
+async def get_unread() -> str:
+    """Get all rooms with unread messages and their latest unread content."""
+    main_logger.info("get_unread called")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    try:
+        result = await rocket_client.async_request("GET", "subscriptions.get")
+        if not result.get('success'):
+            return f"Failed to get subscriptions: {result.get('error', 'Unknown error')}"
+
+        unread_rooms = []
+        for sub in result.get('update', []):
+            unread = sub.get('unread', 0)
+            if unread > 0:
+                room_name = sub.get('name', sub.get('fname', 'N/A'))
+                room_id = sub.get('rid', 'N/A')
+                room_type = {'d': 'DM', 'c': 'Channel', 'p': 'Group'}.get(sub.get('t', ''), 'Unknown')
+                unread_rooms.append({
+                    'name': room_name, 'id': room_id,
+                    'type': room_type, 'unread': unread,
+                })
+
+        if not unread_rooms:
+            return "No unread messages"
+
+        # 读取每个未读房间的最新消息
+        lines = []
+        for room in unread_rooms:
+            lines.append(f"\n[{room['type']}] {room['name']} ({room['unread']} unread, ID: {room['id']})")
+            try:
+                msgs = None
+                for endpoint in ["channels.messages", "groups.messages", "im.messages"]:
+                    try:
+                        msgs = await rocket_client.async_request(
+                            "GET", endpoint,
+                            params={"roomId": room['id'], "count": room['unread']}
+                        )
+                        break
+                    except Exception:
+                        continue
+                if msgs and msgs.get('success'):
+                    for msg in msgs.get('messages', []):
+                        ts = msg.get('ts', '')
+                        user = msg.get('u', {}).get('username', 'Unknown')
+                        text = msg.get('msg', '')
+                        msg_id = msg.get('_id', '')
+                        lines.append(f"  [{ts}] (id: {msg_id}) {user}: {text}")
+            except Exception as e:
+                lines.append(f"  (failed to read messages: {e})")
+
+        return "Unread messages:" + "\n".join(lines)
+    except Exception as e:
+        main_logger.error(f"Error getting unread: {str(e)}")
+        return f"Error getting unread: {str(e)}"
+
+@mcp.tool()
+async def send_file(channel: str, file_path: str, message: str = "") -> str:
+    """Send a file (image, document, etc.) to a channel or user.
+
+    Args:
+        channel: Channel name, channel ID, or @username for DM
+        file_path: Absolute path to the file to upload
+        message: Optional text message to send with the file
+    """
+    main_logger.info(f"send_file called - channel: {channel}, file: {file_path}")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    import os
+    if not os.path.exists(file_path):
+        return f"File not found: {file_path}"
+
+    try:
+        # @username -> 通过 im.create 解析为 room ID
+        room_id = channel
+        if channel.startswith("@"):
+            username = channel[1:]
+            im_result = await rocket_client.async_request(
+                "POST", "im.create", json_data={"username": username}
+            )
+            if im_result.get('success') and 'room' in im_result:
+                room_id = im_result['room']['_id']
+            else:
+                return f"Failed to resolve DM room for {channel}"
+
+        url = f"{rocket_client.server_url}/api/v1/rooms.upload/{room_id}"
+        filename = os.path.basename(file_path)
+
+        async with httpx.AsyncClient(verify=rocket_client.verify_ssl) as client:
+            with open(file_path, "rb") as f:
+                files = {"file": (filename, f)}
+                data = {}
+                if message:
+                    data["msg"] = message
+                response = await client.post(
+                    url,
+                    headers=rocket_client._auth_headers(),
+                    files=files,
+                    data=data,
+                    timeout=60.0,
+                )
+            response.raise_for_status()
+            result = response.json()
+
+        if result.get('success'):
+            main_logger.info(f"File sent to {channel}")
+            return f"File '{filename}' sent to {channel}"
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            main_logger.error(f"Failed to send file to {channel}: {error_msg}")
+            return f"Failed to send file: {error_msg}"
+    except Exception as e:
+        main_logger.error(f"Error sending file to {channel}: {str(e)}")
+        return f"Error sending file: {str(e)}"
 
 @mcp.tool()
 async def list_channels() -> str:
@@ -205,7 +395,7 @@ async def list_channels() -> str:
 
 @mcp.tool()
 async def list_all_rooms() -> str:
-    """List all rooms (channels and groups) available to the user."""
+    """List all rooms (channels, groups and DMs) available to the user."""
     main_logger.info("list_all_rooms called")
     
     if not rocket_client:
@@ -231,7 +421,14 @@ async def list_all_rooms() -> str:
             main_logger.info(f"Retrieved {groups_count} groups")
             for group in groups_result['groups']:
                 all_rooms.append(f"[Group] {group.get('name', 'N/A')} (ID: {group.get('_id', 'N/A')})")
-        
+
+        # Get DMs
+        im_result = await rocket_client.async_request("GET", "im.list")
+        if im_result.get('success') and 'ims' in im_result:
+            for im in im_result['ims']:
+                usernames = ', '.join(im.get('usernames', []))
+                all_rooms.append(f"[DM] {usernames} (ID: {im.get('_id', 'N/A')})")
+
         main_logger.info(f"Total rooms found: {len(all_rooms)}")
         
         if not all_rooms:
@@ -309,24 +506,33 @@ async def create_channel(name: str) -> str:
 
 @mcp.tool()
 async def get_channel_messages(room_id: str, count: int = 20) -> str:
-    """Get messages from a specific channel.
+    """Get messages from a channel or group.
 
     Args:
-        room_id: ID of the room/channel
+        room_id: ID of the room/channel/group
         count: Number of messages to retrieve (default: 20, max: 100)
     """
     main_logger.info(f"get_channel_messages called for room_id: {room_id}, count: {count}")
-    
+
     if not rocket_client:
         main_logger.error("RocketChat client not initialized")
         return "RocketChat client not initialized"
-    
+
     try:
-        count = min(count, 100)  # Limit to 100 messages
-        result = await rocket_client.async_request(
-            "GET", "channels.messages",
-            params={"roomId": room_id, "count": count}
-        )
+        count = min(count, 100)
+        # 依次尝试 channels / groups / im 三种端点
+        result = None
+        for endpoint in ["channels.messages", "groups.messages", "im.messages"]:
+            try:
+                result = await rocket_client.async_request(
+                    "GET", endpoint,
+                    params={"roomId": room_id, "count": count}
+                )
+                break
+            except Exception:
+                continue
+        if result is None:
+            return f"Failed to get messages: room {room_id} not found in channels/groups/im"
         
         if result.get('success') and 'messages' in result:
             messages = result['messages']
@@ -337,10 +543,11 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
             
             formatted_messages = []
             for msg in messages:
-                timestamp = msg.get('ts', {}).get('$date', 'N/A')
+                timestamp = msg.get('ts', 'N/A')
                 user = msg.get('u', {}).get('username', 'Unknown')
                 text = msg.get('msg', 'No content')
-                formatted_messages.append(f"[{timestamp}] {user}: {text}")
+                msg_id = msg.get('_id', 'N/A')
+                formatted_messages.append(f"[{timestamp}] (id: {msg_id}) {user}: {text}")
             
             return f"Messages from channel (last {len(messages)}):\n" + "\n".join(formatted_messages)
         else:
@@ -351,13 +558,13 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
         main_logger.error(f"Error getting messages from room {room_id}: {str(e)}")
         return f"Error getting messages: {str(e)}"
 
-async def initialize_client(server_url: str, username: str, password: str):
+async def initialize_client(server_url: str, username: str, password: str, verify_ssl: bool = True):
     """Initialize the RocketChat client"""
     global rocket_client
     main_logger.info(f"Initializing RocketChat client for server: {server_url}, user: {username}")
-    
+
     try:
-        rocket_client = RocketChatAPI(server_url, username, password)
+        rocket_client = RocketChatAPI(server_url, username, password, verify_ssl=verify_ssl)
         await rocket_client.login(username, password)
         main_logger.info("RocketChat client initialized successfully")
         return True
@@ -367,32 +574,33 @@ async def initialize_client(server_url: str, username: str, password: str):
 
 if __name__ == "__main__":
     main_logger.info("Starting RocketChat MCP Server")
-    
+
     parser = argparse.ArgumentParser(description="RocketChat MCP Server")
     parser.add_argument("--server-url", required=True, help="RocketChat server URL")
-    parser.add_argument("--username", required=True, help="RocketChat username")
-    parser.add_argument("--password", required=True, help="RocketChat password")
-    
+    parser.add_argument("--username", help="RocketChat username")
+    parser.add_argument("--password", help="RocketChat password")
+    parser.add_argument("--auth-token", help="RocketChat personal access token")
+    parser.add_argument("--user-id", help="RocketChat user ID")
+    parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification")
+
     args = parser.parse_args()
-    main_logger.info(f"Arguments parsed - server: {args.server_url}, username: {args.username}")
-    
-    # Initialize the client
-    async def setup():
-        main_logger.info("Starting client setup")
-        success = await initialize_client(args.server_url, args.username, args.password)
-        if not success:
-            main_logger.error("Failed to initialize RocketChat client, exiting")
-            print("Failed to initialize RocketChat client")
+    verify_ssl = not args.no_verify_ssl
+
+    if args.auth_token and args.user_id:
+        main_logger.info(f"Using token auth for user_id: {args.user_id}")
+        rocket_client = RocketChatAPI(
+            args.server_url, user_id=args.user_id, auth_token=args.auth_token,
+            verify_ssl=verify_ssl,
+        )
+    elif args.username and args.password:
+        main_logger.info(f"Using password auth for username: {args.username}")
+        try:
+            asyncio.run(initialize_client(args.server_url, args.username, args.password, verify_ssl=verify_ssl))
+        except Exception as e:
+            main_logger.error(f"Setup failed: {e}")
             exit(1)
-        main_logger.info("Client setup completed successfully")
-    
-    # Run setup before starting the server
-    try:
-        asyncio.run(setup())
-    except Exception as e:
-        main_logger.error(f"Setup failed: {e}")
-        exit(1)
-    
-    # Initialize and run the server
+    else:
+        parser.error("Provide either --auth-token/--user-id or --username/--password")
+
     main_logger.info("Starting MCP server with stdio transport")
     mcp.run(transport='stdio')
