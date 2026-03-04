@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import tempfile
 from datetime import datetime
 
 from typing import Any
@@ -292,7 +293,15 @@ async def get_unread() -> str:
                         user = msg.get('u', {}).get('username', 'Unknown')
                         text = msg.get('msg', '')
                         msg_id = msg.get('_id', '')
-                        lines.append(f"  [{ts}] (id: {msg_id}) {user}: {text}")
+                        line = f"  [{ts}] (id: {msg_id}) {user}: {text}"
+                        files = msg.get('files', [])
+                        if not files and msg.get('file'):
+                            files = [msg['file']]
+                        for f in files:
+                            fname = f.get('name', 'unknown')
+                            ftype = f.get('type', '')
+                            line += f"\n    📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
+                        lines.append(line)
             except Exception as e:
                 lines.append(f"  (failed to read messages: {e})")
 
@@ -547,7 +556,16 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
                 user = msg.get('u', {}).get('username', 'Unknown')
                 text = msg.get('msg', 'No content')
                 msg_id = msg.get('_id', 'N/A')
-                formatted_messages.append(f"[{timestamp}] (id: {msg_id}) {user}: {text}")
+                line = f"[{timestamp}] (id: {msg_id}) {user}: {text}"
+                # 显示附件信息
+                files = msg.get('files', [])
+                if not files and msg.get('file'):
+                    files = [msg['file']]
+                for f in files:
+                    fname = f.get('name', 'unknown')
+                    ftype = f.get('type', '')
+                    line += f"\n  📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
+                formatted_messages.append(line)
             
             return f"Messages from channel (last {len(messages)}):\n" + "\n".join(formatted_messages)
         else:
@@ -557,6 +575,75 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
     except Exception as e:
         main_logger.error(f"Error getting messages from room {room_id}: {str(e)}")
         return f"Error getting messages: {str(e)}"
+
+@mcp.tool()
+async def download_attachment(message_id: str) -> str:
+    """Download attachments from a message. Returns local file paths that can be viewed with the Read tool.
+
+    Args:
+        message_id: The message ID (shown as 'id: xxx' in message listings)
+    """
+    main_logger.info(f"download_attachment called for message_id: {message_id}")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    try:
+        # 获取消息详情
+        result = await rocket_client.async_request(
+            "GET", "chat.getMessage", params={"msgId": message_id}
+        )
+        if not result.get('success'):
+            return f"Failed to get message: {result.get('error', 'Unknown error')}"
+
+        msg = result.get('message', {})
+        files = msg.get('files', [])
+        file_obj = msg.get('file')
+
+        # 兼容：有的消息用 files 数组，有的用单个 file 对象
+        if not files and file_obj:
+            files = [file_obj]
+        if not files:
+            return f"Message {message_id} has no attachments"
+
+        downloaded = []
+        for f in files:
+            file_id = f.get('_id')
+            file_name = f.get('name', 'unknown')
+            if not file_id:
+                continue
+
+            # RocketChat 文件下载 URL
+            download_url = f"{rocket_client.server_url}/file-upload/{file_id}/{file_name}"
+            main_logger.info(f"Downloading: {download_url}")
+
+            async with httpx.AsyncClient(verify=rocket_client.verify_ssl) as client:
+                resp = await client.get(
+                    download_url,
+                    headers=rocket_client._auth_headers(),
+                    timeout=60.0,
+                    follow_redirects=True,
+                )
+                resp.raise_for_status()
+
+                # 保存到 /tmp
+                save_path = os.path.join(tempfile.gettempdir(), f"rc_{file_id}_{file_name}")
+                with open(save_path, "wb") as out:
+                    out.write(resp.content)
+
+                downloaded.append(save_path)
+                main_logger.info(f"Saved attachment to: {save_path}")
+
+        if not downloaded:
+            return f"Message {message_id} has file metadata but no downloadable files"
+
+        paths_str = "\n".join(downloaded)
+        return f"Downloaded {len(downloaded)} attachment(s):\n{paths_str}\n\nUse the Read tool to view these files."
+
+    except Exception as e:
+        main_logger.error(f"Error downloading attachment: {str(e)}")
+        return f"Error downloading attachment: {str(e)}"
+
 
 async def initialize_client(server_url: str, username: str, password: str, verify_ssl: bool = True):
     """Initialize the RocketChat client"""
