@@ -294,6 +294,10 @@ async def get_unread() -> str:
                         text = msg.get('msg', '')
                         msg_id = msg.get('_id', '')
                         line = f"  [{ts}] (id: {msg_id}) {user}: {text}"
+                        for att in msg.get('attachments', []) or []:
+                            desc = (att.get('description') or '').strip()
+                            if desc:
+                                line += f"\n    💬 {desc}"
                         files = msg.get('files', [])
                         if not files and msg.get('file'):
                             files = [msg['file']]
@@ -557,7 +561,12 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
                 text = msg.get('msg', 'No content')
                 msg_id = msg.get('_id', 'N/A')
                 line = f"[{timestamp}] (id: {msg_id}) {user}: {text}"
-                # 显示附件信息
+                # 显示附件 caption / description（如图片附文）
+                for att in msg.get('attachments', []) or []:
+                    desc = (att.get('description') or '').strip()
+                    if desc:
+                        line += f"\n  💬 {desc}"
+                # 显示附件文件
                 files = msg.get('files', [])
                 if not files and msg.get('file'):
                     files = [msg['file']]
