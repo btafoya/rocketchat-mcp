@@ -222,7 +222,7 @@ async def list_users() -> str:
             if not users:
                 return "No users found"
             
-            # Renvoyer le username, emails, name
+            # return username, emails, name
             users_list = ""
             for user in users:
                 user_info = f"Username: {user.get('username', 'N/A')}\nEmail: {user.get('emails', [{}])[0].get('address', 'N/A') if user.get('emails') else 'N/A'}\nName: {user.get('name', 'N/A')}\n"
@@ -359,7 +359,7 @@ async def get_unread() -> str:
         if not unread_rooms:
             return "No unread messages"
 
-        # 读取每个未读房间的最新消息
+        # fetch the latest messages for each unread room
         lines = []
         for room in unread_rooms:
             lines.append(f"\n[{room['type']}] {room['name']} ({room['unread']} unread, ID: {room['id']})")
@@ -398,7 +398,7 @@ async def send_file(channel: str, file_path: str, message: str = "") -> str:
         return f"File not found: {file_path}"
 
     try:
-        # @username -> 通过 im.create 解析为 room ID
+        # @username -> resolve to a room ID via im.create
         room_id = channel
         if channel.startswith("@"):
             username = channel[1:]
@@ -650,7 +650,7 @@ async def download_attachment(message_id: str) -> str:
         return "RocketChat client not initialized"
 
     try:
-        # 获取消息详情
+        # fetch the message details
         result = await rocket_client.async_request(
             "GET", "chat.getMessage", params={"msgId": message_id}
         )
@@ -661,7 +661,7 @@ async def download_attachment(message_id: str) -> str:
         files = msg.get('files', [])
         file_obj = msg.get('file')
 
-        # 兼容：有的消息用 files 数组，有的用单个 file 对象
+        # some messages use a files array, others a single file object
         if not files and file_obj:
             files = [file_obj]
         if not files:
@@ -674,7 +674,7 @@ async def download_attachment(message_id: str) -> str:
             if not file_id:
                 continue
 
-            # RocketChat 文件下载 URL
+            # RocketChat file download URL
             download_url = f"{rocket_client.server_url}/file-upload/{file_id}/{file_name}"
             main_logger.info(f"Downloading: {download_url}")
 
