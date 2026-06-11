@@ -2,8 +2,12 @@ import argparse
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
+import threading
+import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 from typing import Any
 import httpx
@@ -13,13 +17,13 @@ from mcp.server.fastmcp import FastMCP
 def setup_logging():
     log_dir = os.path.dirname(os.path.abspath(__file__))
     log_file = os.path.join(log_dir, 'rocketchat_mcp.log')
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler()  # Also log to console
+            RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=1, encoding='utf-8'),
+            logging.StreamHandler()  # stderr; the stdio protocol uses stdout and is unaffected
         ]
     )
     
@@ -46,6 +50,9 @@ class RocketChatAPI:
         self.username = username
         self.password = password
         self.verify_ssl = verify_ssl
+        self._client = None  # persistent AsyncClient, lazily created, reused for connection pooling
+        self._room_endpoint = {}  # roomId -> discovered *.messages endpoint, avoids re-probing on repeated reads
+        self._room_id_cache = {}  # roomId or room name -> roomId (read/search endpoints only accept roomId)
         
         self.logger.info(f"Initializing RocketChat API client for server: {self.server_url}")
         
@@ -95,27 +102,107 @@ class RocketChatAPI:
             'X-User-Id': self.user_id,
         }
 
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(verify=self.verify_ssl, timeout=30.0)
+        return self._client
+
     async def async_request(self, method: str, endpoint: str, json_data=None, params=None):
         """Make async HTTP request to RocketChat API"""
         url = f"{self.server_url}/api/v1/{endpoint}"
         self.logger.info(f"Making {method} request to {endpoint}")
-        
-        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
+
+        try:
+            response = await self._get_client().request(
+                method, url,
+                headers=self._headers(),
+                json=json_data,
+                params=params,
+            )
+            response.raise_for_status()
+            result = response.json()
+            self.logger.info(f"Request {method} {endpoint} successful")
+            return result
+        except Exception as e:
+            self.logger.error(f"{method} {endpoint} error: {e}")
+            raise
+
+    async def resolve_room_id(self, room: str) -> str:
+        """Resolve a roomId or room name to a roomId (*.messages / chat.search only
+        accept roomId, while chat.postMessage accepts both — rooms are often
+        referred to by name)."""
+        cached = self._room_id_cache.get(room)
+        if cached:
+            return cached
+        for param_key in ("roomId", "roomName"):
             try:
-                response = await client.request(
-                    method, url,
-                    headers=self._headers(),
-                    json=json_data,
-                    params=params,
-                    timeout=30.0
+                result = await self.async_request("GET", "rooms.info", params={param_key: room})
+                rid = result.get("room", {}).get("_id")
+                if rid:
+                    self._room_id_cache[room] = rid
+                    return rid
+            except Exception:
+                continue
+        return room  # resolution failed: pass through and let the downstream endpoint report the actual error
+
+    async def fetch_room_messages(self, room: str, params: dict):
+        """Fetch messages by roomId or room name, probing the channels/groups/im
+        endpoints and caching the working one to avoid wasted requests on
+        repeated reads."""
+        room_id = await self.resolve_room_id(room)
+        cached = self._room_endpoint.get(room_id)
+        endpoints = [cached] if cached else ["channels.messages", "groups.messages", "im.messages"]
+
+        last_error = None
+        for endpoint in endpoints:
+            try:
+                result = await self.async_request(
+                    "GET", endpoint, params={"roomId": room_id, **params}
                 )
-                response.raise_for_status()
-                result = response.json()
-                self.logger.info(f"Request {method} {endpoint} successful")
+                self._room_endpoint[room_id] = endpoint
                 return result
+            except httpx.HTTPStatusError as e:
+                # 401/403 cannot be fixed by trying another endpoint (bad token /
+                # no permission): fail fast instead of amplifying into a chain
+                # of doomed requests
+                if e.response.status_code in (401, 403):
+                    raise
+                last_error = e
+                continue
+            except httpx.TransportError:
+                raise  # transport failures are unrelated to endpoint type; retrying others is pointless
             except Exception as e:
-                self.logger.error(f"{method} {endpoint} error: {e}")
-                raise
+                last_error = e
+                continue
+
+        # cached endpoint went stale (e.g. room type changed): clear it and re-probe once
+        if cached:
+            self._room_endpoint.pop(room_id, None)
+            return await self.fetch_room_messages(room_id, params)
+        raise last_error if last_error else Exception(f"room {room} not found")
+
+def format_message_line(msg: dict, indent: str = "") -> str:
+    """Uniform single-message rendering: timestamp + id + user + text +
+    attachment captions / file hints. Fields may be null (not just absent), so
+    use `or` fallbacks to keep one bad message from breaking the whole page."""
+    ts = msg.get('ts', 'N/A')
+    user = (msg.get('u') or {}).get('username', 'Unknown')
+    text = msg.get('msg', '')
+    msg_id = msg.get('_id', 'N/A')
+    line = f"{indent}[{ts}] (id: {msg_id}) {user}: {text}"
+    for att in msg.get('attachments') or []:
+        desc = (att.get('description') or '').strip()
+        if desc:
+            line += f"\n{indent}  💬 {desc}"
+    files = msg.get('files') or []
+    if not files and msg.get('file'):
+        files = [msg['file']]
+    for f in files:
+        fname = f.get('name', 'unknown')
+        ftype = f.get('type', '')
+        line += f"\n{indent}  📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
+    return line
+
 
 @mcp.tool()
 async def list_users() -> str:
@@ -277,35 +364,14 @@ async def get_unread() -> str:
         for room in unread_rooms:
             lines.append(f"\n[{room['type']}] {room['name']} ({room['unread']} unread, ID: {room['id']})")
             try:
-                msgs = None
-                for endpoint in ["channels.messages", "groups.messages", "im.messages"]:
-                    try:
-                        msgs = await rocket_client.async_request(
-                            "GET", endpoint,
-                            params={"roomId": room['id'], "count": room['unread']}
-                        )
-                        break
-                    except Exception:
-                        continue
-                if msgs and msgs.get('success'):
+                msgs = await rocket_client.fetch_room_messages(
+                    room['id'], {"count": room['unread']}
+                )
+                if msgs.get('success'):
                     for msg in msgs.get('messages', []):
-                        ts = msg.get('ts', '')
-                        user = msg.get('u', {}).get('username', 'Unknown')
-                        text = msg.get('msg', '')
-                        msg_id = msg.get('_id', '')
-                        line = f"  [{ts}] (id: {msg_id}) {user}: {text}"
-                        for att in msg.get('attachments', []) or []:
-                            desc = (att.get('description') or '').strip()
-                            if desc:
-                                line += f"\n    💬 {desc}"
-                        files = msg.get('files', [])
-                        if not files and msg.get('file'):
-                            files = [msg['file']]
-                        for f in files:
-                            fname = f.get('name', 'unknown')
-                            ftype = f.get('type', '')
-                            line += f"\n    📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
-                        lines.append(line)
+                        lines.append(format_message_line(msg, indent="  "))
+                else:
+                    lines.append(f"  (failed to read messages: {msgs.get('error', 'unknown')})")
             except Exception as e:
                 lines.append(f"  (failed to read messages: {e})")
 
@@ -328,7 +394,6 @@ async def send_file(channel: str, file_path: str, message: str = "") -> str:
     if not rocket_client:
         return "RocketChat client not initialized"
 
-    import os
     if not os.path.exists(file_path):
         return f"File not found: {file_path}"
 
@@ -348,21 +413,21 @@ async def send_file(channel: str, file_path: str, message: str = "") -> str:
         url = f"{rocket_client.server_url}/api/v1/rooms.upload/{room_id}"
         filename = os.path.basename(file_path)
 
-        async with httpx.AsyncClient(verify=rocket_client.verify_ssl) as client:
-            with open(file_path, "rb") as f:
-                files = {"file": (filename, f)}
-                data = {}
-                if message:
-                    data["msg"] = message
-                response = await client.post(
-                    url,
-                    headers=rocket_client._auth_headers(),
-                    files=files,
-                    data=data,
-                    timeout=60.0,
-                )
-            response.raise_for_status()
-            result = response.json()
+        client = rocket_client._get_client()
+        with open(file_path, "rb") as f:
+            files = {"file": (filename, f)}
+            data = {}
+            if message:
+                data["msg"] = message
+            response = await client.post(
+                url,
+                headers=rocket_client._auth_headers(),
+                files=files,
+                data=data,
+                timeout=60.0,
+            )
+        response.raise_for_status()
+        result = response.json()
 
         if result.get('success'):
             main_logger.info(f"File sent to {channel}")
@@ -374,37 +439,6 @@ async def send_file(channel: str, file_path: str, message: str = "") -> str:
     except Exception as e:
         main_logger.error(f"Error sending file to {channel}: {str(e)}")
         return f"Error sending file: {str(e)}"
-
-@mcp.tool()
-async def list_channels() -> str:
-    """List all channels available to the user."""
-    main_logger.info("list_channels called")
-    
-    if not rocket_client:
-        main_logger.error("RocketChat client not initialized")
-        return "RocketChat client not initialized"
-    
-    try:
-        result = await rocket_client.async_request("GET", "channels.list")
-        if result.get('success') and 'channels' in result:
-            channels = result['channels']
-            main_logger.info(f"Retrieved {len(channels)} channels")
-            
-            if not channels:
-                return "No channels found"
-            
-            channel_list = []
-            for channel in channels:
-                channel_list.append(f"- {channel.get('name', 'N/A')} (ID: {channel.get('_id', 'N/A')})")
-            
-            return "Available channels:\n" + "\n".join(channel_list)
-        else:
-            error_msg = result.get('error', 'Unknown error')
-            main_logger.error(f"Failed to list channels: {error_msg}")
-            return f"Failed to list channels: {error_msg}"
-    except Exception as e:
-        main_logger.error(f"Error listing channels: {str(e)}")
-        return f"Error listing channels: {str(e)}"
 
 @mcp.tool()
 async def list_all_rooms() -> str:
@@ -494,11 +528,11 @@ async def create_channel(name: str) -> str:
         name: Name of the channel to create
     """
     main_logger.info(f"create_channel called for channel: {name}")
-    
+
     if not rocket_client:
         main_logger.error("RocketChat client not initialized")
         return "RocketChat client not initialized"
-    
+
     try:
         result = await rocket_client.async_request(
             "POST", "channels.create",
@@ -518,14 +552,17 @@ async def create_channel(name: str) -> str:
         return f"Error creating channel: {str(e)}"
 
 @mcp.tool()
-async def get_channel_messages(room_id: str, count: int = 20) -> str:
-    """Get messages from a channel or group.
+async def get_channel_messages(room_id: str, count: int = 20, offset: int = 0) -> str:
+    """Get messages from a channel, group or DM (newest first).
 
     Args:
-        room_id: ID of the room/channel/group
+        room_id: Room ID or room name of the channel/group/DM
         count: Number of messages to retrieve (default: 20, max: 100)
+        offset: Skip this many newest messages — use to page back through history
+                instead of re-reading with a larger count (e.g. offset=20 to get
+                the 20 messages older than the first page)
     """
-    main_logger.info(f"get_channel_messages called for room_id: {room_id}, count: {count}")
+    main_logger.info(f"get_channel_messages called for room_id: {room_id}, count: {count}, offset: {offset}")
 
     if not rocket_client:
         main_logger.error("RocketChat client not initialized")
@@ -533,50 +570,28 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
 
     try:
         count = min(count, 100)
-        # 依次尝试 channels / groups / im 三种端点
-        result = None
-        for endpoint in ["channels.messages", "groups.messages", "im.messages"]:
-            try:
-                result = await rocket_client.async_request(
-                    "GET", endpoint,
-                    params={"roomId": room_id, "count": count}
-                )
-                break
-            except Exception:
-                continue
-        if result is None:
-            return f"Failed to get messages: room {room_id} not found in channels/groups/im"
-        
+        params = {"count": count}
+        if offset:
+            params["offset"] = offset
+        try:
+            result = await rocket_client.fetch_room_messages(room_id, params)
+        except Exception as e:
+            # preserve the real error category (401 / network failure != room
+            # not found) to avoid misleading the caller
+            return f"Failed to get messages from room {room_id}: {e}"
+
         if result.get('success') and 'messages' in result:
             messages = result['messages']
             main_logger.info(f"Retrieved {len(messages)} messages from room {room_id}")
             
             if not messages:
                 return "No messages found in this channel"
-            
-            formatted_messages = []
-            for msg in messages:
-                timestamp = msg.get('ts', 'N/A')
-                user = msg.get('u', {}).get('username', 'Unknown')
-                text = msg.get('msg', 'No content')
-                msg_id = msg.get('_id', 'N/A')
-                line = f"[{timestamp}] (id: {msg_id}) {user}: {text}"
-                # 显示附件 caption / description（如图片附文）
-                for att in msg.get('attachments', []) or []:
-                    desc = (att.get('description') or '').strip()
-                    if desc:
-                        line += f"\n  💬 {desc}"
-                # 显示附件文件
-                files = msg.get('files', [])
-                if not files and msg.get('file'):
-                    files = [msg['file']]
-                for f in files:
-                    fname = f.get('name', 'unknown')
-                    ftype = f.get('type', '')
-                    line += f"\n  📎 {fname} ({ftype}) [use download_attachment with id: {msg_id}]"
-                formatted_messages.append(line)
-            
-            return f"Messages from channel (last {len(messages)}):\n" + "\n".join(formatted_messages)
+
+            formatted_messages = [format_message_line(msg) for msg in messages]
+            header = f"Messages from channel (last {len(messages)}"
+            if offset:
+                header += f", offset {offset}"
+            return header + "):\n" + "\n".join(formatted_messages)
         else:
             error_msg = result.get('error', 'Unknown error')
             main_logger.error(f"Failed to get messages from room {room_id}: {error_msg}")
@@ -584,6 +599,43 @@ async def get_channel_messages(room_id: str, count: int = 20) -> str:
     except Exception as e:
         main_logger.error(f"Error getting messages from room {room_id}: {str(e)}")
         return f"Error getting messages: {str(e)}"
+
+@mcp.tool()
+async def search_messages(room_id: str, query: str, count: int = 20) -> str:
+    """Search messages in a room by keyword. Much cheaper than paging through
+    history with get_channel_messages when looking for a specific message.
+
+    Args:
+        room_id: Room ID or room name of the channel/group/DM to search in
+        query: Search keyword(s)
+        count: Max results to return (default: 20, max: 100)
+    """
+    main_logger.info(f"search_messages called - room_id: {room_id}, query: {query}, count: {count}")
+
+    if not rocket_client:
+        return "RocketChat client not initialized"
+
+    try:
+        count = min(count, 100)
+        rid = await rocket_client.resolve_room_id(room_id)
+        result = await rocket_client.async_request(
+            "GET", "chat.search",
+            params={"roomId": rid, "searchText": query, "count": count}
+        )
+        if result.get('success'):
+            messages = result.get('messages', [])
+            if not messages:
+                return f"No messages matching '{query}' in room {room_id}"
+            formatted = [format_message_line(msg) for msg in messages]
+            return f"Found {len(messages)} message(s) matching '{query}':\n" + "\n".join(formatted)
+        else:
+            error_msg = result.get('error', 'Unknown error')
+            main_logger.error(f"Search failed in room {room_id}: {error_msg}")
+            return f"Search failed: {error_msg}"
+    except Exception as e:
+        main_logger.error(f"Error searching room {room_id}: {str(e)}")
+        return f"Error searching messages: {str(e)}"
+
 
 @mcp.tool()
 async def download_attachment(message_id: str) -> str:
@@ -626,22 +678,21 @@ async def download_attachment(message_id: str) -> str:
             download_url = f"{rocket_client.server_url}/file-upload/{file_id}/{file_name}"
             main_logger.info(f"Downloading: {download_url}")
 
-            async with httpx.AsyncClient(verify=rocket_client.verify_ssl) as client:
-                resp = await client.get(
-                    download_url,
-                    headers=rocket_client._auth_headers(),
-                    timeout=60.0,
-                    follow_redirects=True,
-                )
-                resp.raise_for_status()
+            resp = await rocket_client._get_client().get(
+                download_url,
+                headers=rocket_client._auth_headers(),
+                timeout=60.0,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
 
-                # 保存到 /tmp
-                save_path = os.path.join(tempfile.gettempdir(), f"rc_{file_id}_{file_name}")
-                with open(save_path, "wb") as out:
-                    out.write(resp.content)
+            # save to the temp dir
+            save_path = os.path.join(tempfile.gettempdir(), f"rc_{file_id}_{file_name}")
+            with open(save_path, "wb") as out:
+                out.write(resp.content)
 
-                downloaded.append(save_path)
-                main_logger.info(f"Saved attachment to: {save_path}")
+            downloaded.append(save_path)
+            main_logger.info(f"Saved attachment to: {save_path}")
 
         if not downloaded:
             return f"Message {message_id} has file metadata but no downloadable files"
@@ -668,18 +719,51 @@ async def initialize_client(server_url: str, username: str, password: str, verif
         main_logger.error(f"Failed to initialize RocketChat client: {e}")
         return False
 
+def start_orphan_watchdog(interval: float):
+    """When the MCP client dies abnormally, the stdio server may linger and
+    such processes pile up over time. Periodically check (POSIX only):
+    - parent became pid 1: this process is orphaned -> exit
+    - grandparent became pid 1: the parent (e.g. a uv wrapper) is orphaned,
+      so the client is gone -> exit
+    """
+    def check():
+        while True:
+            time.sleep(interval)
+            ppid = os.getppid()
+            if ppid == 1:
+                main_logger.info("Orphaned (ppid=1), shutting down")
+                os._exit(0)
+            try:
+                out = subprocess.run(
+                    ["ps", "-o", "ppid=", "-p", str(ppid)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if out.stdout.strip() == "1":
+                    main_logger.info(f"Parent {ppid} orphaned (grandparent=1), shutting down")
+                    os._exit(0)
+            except Exception:
+                pass  # ps failure is not fatal; if the parent really died, ppid becomes 1 on a later check
+
+    threading.Thread(target=check, daemon=True, name="orphan-watchdog").start()
+
+
 if __name__ == "__main__":
     main_logger.info("Starting RocketChat MCP Server")
 
     parser = argparse.ArgumentParser(description="RocketChat MCP Server")
-    parser.add_argument("--server-url", required=True, help="RocketChat server URL")
+    parser.add_argument("--server-url", default=os.getenv("ROCKETCHAT_SERVER_URL"),
+                        help="RocketChat server URL (env: ROCKETCHAT_SERVER_URL)")
     parser.add_argument("--username", help="RocketChat username")
     parser.add_argument("--password", help="RocketChat password")
-    parser.add_argument("--auth-token", help="RocketChat personal access token")
-    parser.add_argument("--user-id", help="RocketChat user ID")
+    parser.add_argument("--auth-token", default=os.getenv("ROCKETCHAT_AUTH_TOKEN"),
+                        help="RocketChat personal access token (env: ROCKETCHAT_AUTH_TOKEN; prefer the env var to keep the token out of process arguments)")
+    parser.add_argument("--user-id", default=os.getenv("ROCKETCHAT_USER_ID"),
+                        help="RocketChat user ID (env: ROCKETCHAT_USER_ID)")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification")
 
     args = parser.parse_args()
+    if not args.server_url:
+        parser.error("--server-url is required (or set ROCKETCHAT_SERVER_URL)")
     verify_ssl = not args.no_verify_ssl
 
     if args.auth_token and args.user_id:
@@ -691,12 +775,21 @@ if __name__ == "__main__":
     elif args.username and args.password:
         main_logger.info(f"Using password auth for username: {args.username}")
         try:
-            asyncio.run(initialize_client(args.server_url, args.username, args.password, verify_ssl=verify_ssl))
+            ok = asyncio.run(initialize_client(args.server_url, args.username, args.password, verify_ssl=verify_ssl))
         except Exception as e:
             main_logger.error(f"Setup failed: {e}")
             exit(1)
+        if not ok:
+            # initialize_client swallows exceptions and returns False; without
+            # this check the server would start with a None token and every
+            # request would fail with a header type error instead of an auth error
+            main_logger.error("Login failed, refusing to start with invalid credentials")
+            exit(1)
     else:
         parser.error("Provide either --auth-token/--user-id or --username/--password")
+
+    watchdog_interval = float(os.getenv("ROCKETCHAT_WATCHDOG_INTERVAL", "60"))
+    start_orphan_watchdog(watchdog_interval)
 
     main_logger.info("Starting MCP server with stdio transport")
     mcp.run(transport='stdio')

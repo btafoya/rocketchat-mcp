@@ -60,3 +60,24 @@ Add the following configuration to your client, replacing `-username-` and `-pas
 Make sure Docker and Python are installed on your system before starting.
 
 For more details, refer to the [Rocket.Chat documentation](https://docs.rocket.chat/).
+---
+
+## Fork Additions (millerchou)
+
+Tools (12): `list_users` / `send_message_in_channel` / `send_direct_message` / `delete_message` /
+`get_unread` / `send_file` / `list_all_rooms` / `get_user_info` / `create_channel` /
+`get_channel_messages` (with `offset` paging, accepts room ID or name) /
+`search_messages` (chat.search) / `download_attachment`
+
+Removed: `list_channels` — fully covered by `list_all_rooms` (same `channels.list` endpoint,
+same fields).
+
+Auth via environment variables (recommended — keeps the token out of process args):
+
+```
+ROCKETCHAT_SERVER_URL / ROCKETCHAT_AUTH_TOKEN / ROCKETCHAT_USER_ID
+```
+
+Robustness: persistent HTTP connection pool, room-endpoint cache, orphan watchdog
+(self-exits when the MCP client dies; interval via `ROCKETCHAT_WATCHDOG_INTERVAL`, default 60s),
+log rotation (1 MB).
