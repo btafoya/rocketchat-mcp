@@ -747,7 +747,8 @@ def start_orphan_watchdog(interval: float):
     threading.Thread(target=check, daemon=True, name="orphan-watchdog").start()
 
 
-if __name__ == "__main__":
+def main():
+    global rocket_client
     main_logger.info("Starting RocketChat MCP Server")
 
     parser = argparse.ArgumentParser(description="RocketChat MCP Server")
@@ -793,3 +794,7 @@ if __name__ == "__main__":
 
     main_logger.info("Starting MCP server with stdio transport")
     mcp.run(transport='stdio')
+
+
+if __name__ == "__main__":
+    main()
