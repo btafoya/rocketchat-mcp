@@ -1,83 +1,98 @@
-# MCP Rocket.Chat Setup Guide
+<!-- mcp-name: io.github.millerchou/rocketchat-mcp -->
 
-Follow these steps to set up and configure MCP Rocket.Chat on your local machine.
+# rocketchat-mcp
 
-## 1. Clone the Repository
+An [MCP](https://modelcontextprotocol.io) server for [Rocket.Chat](https://rocket.chat).
+It lets MCP clients (Claude Desktop, Cursor, Claude Code, etc.) send and read
+messages, send DMs, search history, upload/download files, and manage channels
+on a Rocket.Chat workspace over stdio.
+
+> Actively maintained fork of
+> [elieworkspace/rocketchat-mcp](https://github.com/elieworkspace/rocketchat-mcp),
+> adding Personal Access Token auth, more tools, and reliability/security
+> improvements. See [NOTICE](NOTICE) for attribution.
+
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `send_message_in_channel` | Send a message to a channel |
+| `send_direct_message` | Send a direct message to a user |
+| `delete_message` | Delete a message (your own, unless the role has force-delete) |
+| `get_channel_messages` | Read history of a channel/group/DM; supports `offset` paging and accepts a room ID or name |
+| `search_messages` | Keyword search within a room (`chat.search`) |
+| `get_unread` | List rooms with unread messages and their latest content |
+| `send_file` | Upload a file to a channel or `@user` |
+| `download_attachment` | Download a message's attachments to local files |
+| `list_all_rooms` | List channels, groups and DMs &lowast; |
+| `list_users` | List users &lowast; |
+| `get_user_info` | Get a user's profile |
+| `create_channel` | Create a channel |
+
+&lowast; `list_all_rooms` and `list_users` call workspace-wide endpoints
+(`channels.list` / `users.list`) that require admin or the corresponding
+`view-*` permission. Every other tool works for a normal chat user.
+
+## Authentication
+
+A normal chat user is enough for the core tools. A **Personal Access Token** is
+recommended — it keeps the token out of process arguments:
+
+| Variable | Description |
+| --- | --- |
+| `ROCKETCHAT_SERVER_URL` | Workspace URL, e.g. `https://chat.example.com` |
+| `ROCKETCHAT_USER_ID` | Your Rocket.Chat user ID |
+| `ROCKETCHAT_AUTH_TOKEN` | Personal Access Token |
+| `ROCKETCHAT_WATCHDOG_INTERVAL` | (optional) orphan-watchdog interval in seconds, default `60` |
+
+Username/password is also supported via `--username` / `--password`.
+Use `--no-verify-ssl` for self-signed certificates.
+
+## Usage
+
+### Run with uvx (no clone)
 
 ```bash
-git clone git@github.com:elieworkspace/mcp-rocketchat.git
-cd mcp-rocketchat
+uvx --from git+https://github.com/millerchou/rocketchat-mcp rocketchat-mcp \
+  --server-url https://chat.example.com
 ```
 
-## 2. Start Rocket.Chat with Docker
+Once published to PyPI this becomes simply `uvx rocketchat-mcp`.
 
-```bash
-docker compose up -d
-```
-
-Access Rocket.Chat at [http://localhost:3000](http://localhost:3000).
-
-## 3. Initial Configuration
-
-- Save your admin username and password.
-- Navigate to [http://localhost:3000/admin/settings/Accounts#:rbb:](http://localhost:3000/admin/settings/Accounts#:rbb:)  
-    Disable 2FA and click **Save**.
-
-## 4. Set Up Python Environment
-
-```bash
-uv venv
-.venv\Scripts\activate
-uv add mcp[cli] httpx
-```
-
-## 5. Client Configuration Example
-
-Add the following configuration to your client, replacing `-username-` and `-password-` with your credentials:
+### Client configuration
 
 ```json
 {
-    "mcpServers": {
-        "mcp-rocketchat": {
-            "command": "uv",
-            "args": [
-                "--directory",
-                "C:/Users/-username-/Desktop/mcp-rocketchat",
-                "run",
-                "rocketchat.py",
-                "--server-url", "http://localhost:3000",
-                "--username", "-username-",
-                "--password", "-password-"
-            ]
-        }
+  "mcpServers": {
+    "rocketchat": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/millerchou/rocketchat-mcp", "rocketchat-mcp"],
+      "env": {
+        "ROCKETCHAT_SERVER_URL": "https://chat.example.com",
+        "ROCKETCHAT_USER_ID": "your_user_id",
+        "ROCKETCHAT_AUTH_TOKEN": "your_personal_access_token"
+      }
     }
+  }
 }
 ```
 
----
+### Local development
 
-**Tip:**  
-Make sure Docker and Python are installed on your system before starting.
-
-For more details, refer to the [Rocket.Chat documentation](https://docs.rocket.chat/).
----
-
-## Fork Additions (millerchou)
-
-Tools (12): `list_users` / `send_message_in_channel` / `send_direct_message` / `delete_message` /
-`get_unread` / `send_file` / `list_all_rooms` / `get_user_info` / `create_channel` /
-`get_channel_messages` (with `offset` paging, accepts room ID or name) /
-`search_messages` (chat.search) / `download_attachment`
-
-Removed: `list_channels` — fully covered by `list_all_rooms` (same `channels.list` endpoint,
-same fields).
-
-Auth via environment variables (recommended — keeps the token out of process args):
-
-```
-ROCKETCHAT_SERVER_URL / ROCKETCHAT_AUTH_TOKEN / ROCKETCHAT_USER_ID
+```bash
+git clone https://github.com/millerchou/rocketchat-mcp
+cd rocketchat-mcp
+uv run rocketchat.py --server-url https://chat.example.com \
+  --auth-token "$ROCKETCHAT_AUTH_TOKEN" --user-id "$ROCKETCHAT_USER_ID"
 ```
 
-Robustness: persistent HTTP connection pool, room-endpoint cache, orphan watchdog
-(self-exits when the MCP client dies; interval via `ROCKETCHAT_WATCHDOG_INTERVAL`, default 60s),
-log rotation (1 MB).
+## Reliability
+
+Persistent HTTP connection pool, room-endpoint caching, log rotation (1 MB),
+and an orphan watchdog that self-exits when the MCP client process dies.
+
+## License
+
+Modifications in this fork are released under the [MIT License](LICENSE).
+This is a fork of upstream code originally published without a license; see
+[NOTICE](NOTICE) for details.
