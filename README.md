@@ -50,14 +50,17 @@ Use `--no-verify-ssl` for self-signed certificates.
 
 ## Usage
 
-### Run with uvx (no clone)
+### Run with uvx
 
 ```bash
-uvx --from git+https://github.com/millerchou/rocketchat-mcp rocketchat-mcp \
-  --server-url https://chat.example.com
+uvx rocketchat-mcp --server-url https://chat.example.com
 ```
 
-Once published to PyPI this becomes simply `uvx rocketchat-mcp`.
+To run the latest unreleased code straight from GitHub instead:
+
+```bash
+uvx --from git+https://github.com/millerchou/rocketchat-mcp rocketchat-mcp --server-url https://chat.example.com
+```
 
 ### Client configuration
 
@@ -66,7 +69,7 @@ Once published to PyPI this becomes simply `uvx rocketchat-mcp`.
   "mcpServers": {
     "rocketchat": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/millerchou/rocketchat-mcp", "rocketchat-mcp"],
+      "args": ["rocketchat-mcp"],
       "env": {
         "ROCKETCHAT_SERVER_URL": "https://chat.example.com",
         "ROCKETCHAT_USER_ID": "your_user_id",
